@@ -1,0 +1,15 @@
+{
+  "name": "tokenspeed",
+  "version": "1.0.0",
+  "description": "LLM API benchmark for first output latency, input throughput, and single and concurrent output speed",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "mock": "node scripts/mock-server.js",
+    "test": "node --test scripts/benchmark.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
