@@ -7,6 +7,7 @@
   const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   const CS = getComputedStyle(document.documentElement);
+  const sans = CS.getPropertyValue('--sans').trim();
   const COL = {};
   ['ink', 'muted', 'tint', 'soft', 'card', 'bg', 'c1', 'z1', 'z2', 'z3'].forEach((k) => (COL[k] = CS.getPropertyValue('--' + k).trim()));
   const LANE_KEYS = ['c1', 'z1', 'z2', 'z3'];
@@ -332,7 +333,7 @@
         c.setTransform(dpr, 0, 0, dpr, 0, 0);
         c.clearRect(0, 0, w, h);
         const left = 40, top = 12, bot = h - 30, step = (w - left - 10) / 300;
-        c.font = '700 10px Rubik, sans-serif';
+        c.font = `700 10px ${sans}`;
         c.textBaseline = 'middle';
         for (let k = 0; k <= 4; k++) {
           const v = (max * k) / 4, y = Math.round(bot - (v / max) * (bot - top)) + 0.5;
@@ -387,7 +388,8 @@
     runPrefill: $('#fRunPrefill'), runSingle: $('#fRunSingle'), runDecode: $('#fRunDecode'), ignoreEos: $('#fIgnoreEos'),
   };
   let provider = 'custom';
-  let keys = {}; // 每个服务商各存一份配置
+  const providerSettings = {};
+  const apiKeys = new Map(); // API Key 仅保留在当前页面内存中
   const thinkingLabels = { default: '跟随接口', on: '请求开启', off: '请求关闭' };
   const supportsThinking = () => provider === 'qwen' || provider === 'deepseek' || (provider === 'custom' && segVal('fFormat') === 'openai');
   const segVal = (id) => ($(`#${id} button.on`) || {}).dataset?.v;
@@ -423,13 +425,13 @@
     const p = PROVIDERS.find((x) => x.id === id) || PROVIDERS[0];
     provider = p.id;
     $$('.chip').forEach((c) => c.classList.toggle('on', c.dataset.id === id));
-    const saved = keys[provider] || {};
+    const saved = providerSettings[provider] || {};
     $('#baseField').hidden = id !== 'custom';
     if (id === 'custom') {
       F.base.value = saved.base || '';
       setSeg('fFormat', saved.format || 'openai');
     }
-    F.key.value = saved.key || '';
+    F.key.value = apiKeys.get(provider) || '';
     F.model.value = saved.model != null ? saved.model : p.model;
     F.model.placeholder = p.model ? `例如 ${p.model}` : '填写模型名称，或点「获取列表」';
     setSeg('fThinking', Object.hasOwn(thinkingLabels, saved.thinkingMode) ? saved.thinkingMode : 'default');
@@ -443,8 +445,9 @@
   }
 
   function stash() {
-    keys[provider] = {
-      key: F.key.value.trim(), model: F.model.value.trim(), base: F.base.value.trim(), format: segVal('fFormat'),
+    apiKeys.set(provider, F.key.value.trim());
+    providerSettings[provider] = {
+      model: F.model.value.trim(), base: F.base.value.trim(), format: segVal('fFormat'),
       thinkingMode: segVal('fThinking'),
     };
   }
@@ -509,7 +512,7 @@
     const c = readCfg();
     store.set('ts3.cfg', {
       v: 2,
-      provider, keys, ctx: c.contextTokens, max: c.maxTokens, conc: c.concurrency,
+      provider, providers: providerSettings, ctx: c.contextTokens, max: c.maxTokens, conc: c.concurrency,
       runPrefill: c.runPrefill, runSingle: c.runSingle, runDecode: c.runDecode, ignoreEos: c.ignoreEos, extra: c.extraBody,
     });
     updateCost();
@@ -517,9 +520,16 @@
   }
 
   function restore() {
-    const s = store.get('ts3.cfg', null) || store.get('ts2.cfg', {}) || {};
-    keys = s.keys || {};
-    if (s.ctx && store.get('ts3.cfg', null)) setSeg('fCtx', s.ctx);
+    const current = store.get('ts3.cfg', null);
+    const legacy = store.get('ts2.cfg', null);
+    const s = current || legacy || {};
+    const savedProviders = s.providers || s.keys || {};
+    for (const { id } of PROVIDERS) {
+      if (!savedProviders[id]) continue;
+      const { model, base, format, thinkingMode } = savedProviders[id];
+      providerSettings[id] = { model, base, format, thinkingMode };
+    }
+    if (s.ctx && current) setSeg('fCtx', s.ctx);
     if (s.max && s.v >= 2) setSeg('fMax', s.max); // 旧版本默认 4K，升级后统一回到 2K
     if (s.conc) setSeg('fConc', s.conc);
     if (s.runPrefill === false) F.runPrefill.checked = false;
@@ -528,6 +538,13 @@
     F.ignoreEos.checked = !!s.ignoreEos;
     F.extra.value = s.extra || '';
     selectProvider(s.provider || 'custom', false);
+    if (s.keys || legacy) {
+      // 重写旧配置，清除此前保存在浏览器中的 Key。
+      store.del('ts3.cfg');
+      store.del('ts2.cfg');
+      persist();
+      return;
+    }
     updateCost();
     renderExplain();
   }
@@ -563,10 +580,7 @@
       .join('');
   }
 
-  $('.setup').addEventListener('input', (e) => {
-    if (e.target === F.key || e.target === F.base) scheduleModelFetch();
-    persist();
-  });
+  $('.setup').addEventListener('input', persist);
   $('.setup').addEventListener('change', persist);
   $('#btnEye').addEventListener('click', () => (F.key.type = F.key.type === 'password' ? 'text' : 'password'));
   $('#btnAdv').addEventListener('click', () => {
@@ -575,19 +589,11 @@
     $('#btnAdv').textContent = a.hidden ? '高级设置' : '收起高级设置';
   });
 
-  // 填好 Key 后自动拉取模型列表
-  let fetchT;
-  function scheduleModelFetch() {
-    clearTimeout(fetchT);
-    fetchT = setTimeout(() => fetchModels(true), 900);
-  }
-  async function fetchModels(silent) {
+  async function fetchModels() {
     const c = readCfg();
     const direct = needsBrowserDirect(c.baseUrl);
-    // 本机网络权限由访客点击按钮后触发。
-    if (direct && silent) return;
     if (!c.baseUrl || (!c.apiKey && provider !== 'custom')) {
-      if (!silent) toast(c.baseUrl ? '请先填写 API Key' : '请先填写接口地址', true);
+      toast(c.baseUrl ? '请先填写 API Key' : '请先填写接口地址', true);
       return;
     }
     const btn = $('#btnModels');
@@ -600,20 +606,18 @@
       $('#modelList').innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join('');
       $('#modelHint').textContent = `· 可选 ${r.models.length} 个`;
       if (!F.model.value && r.models[0]) F.model.value = r.models[0];
-      if (!silent) {
-        toast(`获取到 ${r.models.length} 个模型，点模型输入框即可选择`);
-        F.model.focus();
-      }
+      toast(`获取到 ${r.models.length} 个模型，点模型输入框即可选择`);
+      F.model.focus();
       persist();
     } catch (e) {
       $('#modelHint').textContent = '';
-      if (!silent) toast('获取模型列表失败：' + e.message, true);
+      toast('获取模型列表失败：' + e.message, true);
     } finally {
       btn.classList.remove('loading');
       btn.textContent = '获取列表';
     }
   }
-  $('#btnModels').addEventListener('click', () => fetchModels(false));
+  $('#btnModels').addEventListener('click', fetchModels);
 
   // ---------------- 阶段定义
   const STAGE = {
@@ -1364,7 +1368,7 @@
     cv.width = W;
     cv.height = H;
     const c = cv.getContext('2d');
-    const font = (w, sz) => `${w} ${sz}px Rubik, "PingFang SC", "Microsoft YaHei", sans-serif`;
+    const font = (w, sz) => `${w} ${sz}px ${sans}`;
     c.fillStyle = COL.bg;
     c.fillRect(0, 0, W, H);
     const [ri, rname] = mainRating();
@@ -1534,7 +1538,6 @@
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') $('#sheet').classList.remove('open');
-    if (e.key === 'Enter' && !$('#viewSetup').hidden && e.target.tagName === 'INPUT') start(false);
   });
 
   restore();
