@@ -9,6 +9,7 @@ const net = require('net');
 const os = require('os');
 const { runBenchmark } = require('./lib/bench');
 const { listModels } = require('./lib/client');
+const { buildBrowserBundle } = require('./lib/browser-bundle');
 const D = require('./lib/dataset');
 const mock = require('./lib/mock');
 // 前端选择「演示模式」时 baseUrl 传 "demo"，这里换成本机内置的演示服务
@@ -60,6 +61,7 @@ const PORT = Number(process.env.PORT) || 5173;
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC = path.join(__dirname, 'public');
 const runs = new Map();
+let browserBundle;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -160,6 +162,15 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         dataset: { items: D.ITEMS.length, chars: D.TOTAL_CHARS, sources: ['HumanEval (164)', 'MBPP (974)'] },
       });
+    }
+    if (req.method === 'GET' && url.pathname === '/direct-bench.js') {
+      browserBundle ??= buildBrowserBundle();
+      const gzip = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+      res.writeHead(200, {
+        'content-type': MIME['.js'], 'cache-control': 'no-cache', vary: 'Accept-Encoding',
+        ...(gzip ? { 'content-encoding': 'gzip' } : {}),
+      });
+      return res.end(gzip ? browserBundle.gzip : browserBundle.plain);
     }
     if (req.method === 'GET') {
       let p = decodeURIComponent(url.pathname);

@@ -387,9 +387,21 @@
     runPrefill: $('#fRunPrefill'), runSingle: $('#fRunSingle'), runDecode: $('#fRunDecode'), ignoreEos: $('#fIgnoreEos'),
   };
   let provider = 'custom';
-  let keys = {}; // 每个服务商各存一份 key / 模型
+  let keys = {}; // 每个服务商各存一份配置
+  const thinkingLabels = { default: '跟随接口', on: '请求开启', off: '请求关闭' };
+  const supportsThinking = () => provider === 'qwen' || provider === 'deepseek' || (provider === 'custom' && segVal('fFormat') === 'openai');
   const segVal = (id) => ($(`#${id} button.on`) || {}).dataset?.v;
-  const setSeg = (id, v) => $$(`#${id} button`).forEach((b) => b.classList.toggle('on', b.dataset.v === String(v)));
+  const setSeg = (id, v) => $$(`#${id} button`).forEach((b) => {
+    const selected = b.dataset.v === String(v);
+    b.classList.toggle('on', selected);
+    if (b.hasAttribute('aria-pressed')) b.setAttribute('aria-pressed', String(selected));
+  });
+  function syncThinking() {
+    $('#thinkingField').hidden = !supportsThinking();
+    $('#thinkingHint').textContent = provider === 'custom'
+      ? '适用于支持思考开关的 vLLM / SGLang 兼容接口。'
+      : '需上游模型支持思考开关。';
+  }
   $$('.seg').forEach((s) =>
     s.addEventListener('click', (e) => {
       const b = e.target.closest('button');
@@ -411,7 +423,7 @@
     const p = PROVIDERS.find((x) => x.id === id) || PROVIDERS[0];
     provider = p.id;
     $$('.chip').forEach((c) => c.classList.toggle('on', c.dataset.id === id));
-    const saved = keys[id] || {};
+    const saved = keys[provider] || {};
     $('#baseField').hidden = id !== 'custom';
     if (id === 'custom') {
       F.base.value = saved.base || '';
@@ -420,6 +432,8 @@
     F.key.value = saved.key || '';
     F.model.value = saved.model != null ? saved.model : p.model;
     F.model.placeholder = p.model ? `例如 ${p.model}` : '填写模型名称，或点「获取列表」';
+    setSeg('fThinking', Object.hasOwn(thinkingLabels, saved.thinkingMode) ? saved.thinkingMode : 'default');
+    syncThinking();
     const kl = $('#keyLink');
     kl.hidden = !p.key;
     if (p.key) kl.href = p.key;
@@ -429,7 +443,10 @@
   }
 
   function stash() {
-    keys[provider] = { key: F.key.value.trim(), model: F.model.value.trim(), base: F.base.value.trim(), format: segVal('fFormat') };
+    keys[provider] = {
+      key: F.key.value.trim(), model: F.model.value.trim(), base: F.base.value.trim(), format: segVal('fFormat'),
+      thinkingMode: segVal('fThinking'),
+    };
   }
 
   function readCfg() {
@@ -439,6 +456,7 @@
       format: provider === 'custom' ? segVal('fFormat') : p.format || 'openai',
       apiKey: F.key.value.trim(),
       model: F.model.value.trim(),
+      thinkingMode: supportsThinking() ? segVal('fThinking') || 'default' : 'default',
       contextTokens: Number(segVal('fCtx')) || 16000,
       maxTokens: Number(segVal('fMax')) || 2048,
       singleMaxTokens: 2048,
@@ -451,8 +469,43 @@
     };
   }
 
+  function isLoopback(name) {
+    name = name.toLowerCase().replace(/\.$/, '');
+    return name === '[::1]' || name === 'localhost' || name.endsWith('.localhost') || /^127(?:\.\d{1,3}){3}$/.test(name);
+  }
+
+  function needsBrowserDirect(baseUrl) {
+    if (isLoopback(location.hostname)) return false;
+    try {
+      const url = new URL(baseUrl);
+      return ['http:', 'https:'].includes(url.protocol) && isLoopback(url.hostname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  let directClient;
+  function loadDirectClient() {
+    if (!window.isSecureContext) throw new Error('浏览器要求通过 HTTPS 打开 TokenSpeed 才能访问你的本机接口');
+    directClient ??= new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = './direct-bench.js';
+      script.onload = () => {
+        if (window.TokenSpeedDirect) resolve(window.TokenSpeedDirect);
+        else reject(new Error('本机直连组件加载失败'));
+      };
+      script.onerror = () => reject(new Error('本机直连组件加载失败'));
+      document.head.appendChild(script);
+    }).catch((error) => {
+      directClient = null;
+      throw error;
+    });
+    return directClient;
+  }
+
   function persist() {
     stash();
+    syncThinking();
     const c = readCfg();
     store.set('ts3.cfg', {
       v: 2,
@@ -493,6 +546,12 @@
 
   function renderExplain() {
     const c = readCfg();
+    const direct = needsBrowserDirect(c.baseUrl);
+    const hint = $('#directHint');
+    hint.hidden = !direct;
+    hint.textContent = direct ? (window.isSecureContext
+      ? '浏览器直连你的本机接口。请允许本站访问本机，模型服务也需允许本站跨域访问。'
+      : '浏览器要求通过 HTTPS 打开 TokenSpeed 才能访问你的本机接口。') : '';
     const ctx = fmtTok(c.contextTokens);
     $('#explain').innerHTML = [
       ['z1', '响应延迟', '发一句话，多久开始回复'],
@@ -524,6 +583,9 @@
   }
   async function fetchModels(silent) {
     const c = readCfg();
+    const direct = needsBrowserDirect(c.baseUrl);
+    // 本机网络权限由访客点击按钮后触发。
+    if (direct && silent) return;
     if (!c.baseUrl || (!c.apiKey && provider !== 'custom')) {
       if (!silent) toast(c.baseUrl ? '请先填写 API Key' : '请先填写接口地址', true);
       return;
@@ -532,7 +594,8 @@
     btn.classList.add('loading');
     btn.textContent = '获取中';
     try {
-      const r = await fetch('/api/models', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(c) }).then((r) => r.json());
+      const r = direct ? { models: await (await loadDirectClient()).listModels(c) }
+        : await fetch('./api/models', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(c) }).then((r) => r.json());
       if (r.error) throw new Error(r.error);
       $('#modelList').innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join('');
       $('#modelHint').textContent = `· 可选 ${r.models.length} 个`;
@@ -559,7 +622,7 @@
     prefill: { name: '读取', label: '读取速度 · 整体吞吐', scale: () => [0, 5000, 10000, 20000, 40000, 80000], lbl: fmtK, tiers: [[5000, '能用'], [10000, '流畅'], [25000, '飞快'], [50000, '起飞']] },
     single: { name: '峰值', label: '单发峰值速度', scale: () => [0, 25, 50, 80, 120, 200], lbl: fmtK, tiers: [[25, '能用'], [50, '流畅'], [80, '飞快'], [120, '起飞']] },
     // 并发阶段仪表显示合计吞吐，档位按单路平均速度判断
-    decode: { name: '并发', label: '整轮输出吞吐', scale: (n) => [0, 10, 25, 50, 80, 125].map((x) => x * n), lbl: fmtK, tiers: [[20, '能用'], [40, '流畅'], [60, '强劲'], [90, '爆表']] },
+    decode: { name: '并发', label: '实时并发输出速度', scale: (n) => [0, 10, 25, 50, 80, 125].map((x) => x * n), lbl: fmtK, tiers: [[20, '能用'], [40, '流畅'], [60, '强劲'], [90, '爆表']] },
   };
   const tierOf = (k, v) => {
     const t = STAGE[k].tiers;
@@ -633,10 +696,29 @@
     setStep(k, 'active');
   }
 
+  async function runViaServer(cfg, signal) {
+    const res = await fetch('./api/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(cfg), signal });
+    if (!res.ok || !res.body) throw new Error('测速服务异常 HTTP ' + res.status);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (line) on(JSON.parse(line));
+      }
+    }
+  }
+
   async function start(demo) {
     if (S.running) return;
     const cfg = readCfg();
-    if (demo) Object.assign(cfg, { baseUrl: 'demo', model: 'demo-coder', apiKey: 'demo', format: 'openai', extraBody: '', ignoreEos: false, maxTokens: 1024, singleMaxTokens: 600 });
+    if (demo) Object.assign(cfg, { baseUrl: 'demo', model: 'demo-coder', apiKey: 'demo', format: 'openai', thinkingMode: 'default', extraBody: '', ignoreEos: false, maxTokens: 1024, singleMaxTokens: 600 });
     if (!demo) {
       if (!cfg.baseUrl) return toast('请填写接口地址', true), F.base.focus();
       if (!cfg.apiKey && provider !== 'custom') return toast('请先粘贴 API Key', true), F.key.focus();
@@ -650,12 +732,14 @@
       }
     }
     if (!cfg.runPrefill && !cfg.runSingle && !cfg.runDecode) return toast('请至少开启一个测试项目', true);
+    const direct = needsBrowserDirect(cfg.baseUrl);
+    if (direct && !window.isSecureContext) return toast('请通过 HTTPS 打开 TokenSpeed，再测速你的本机接口', true);
     ensureAudio();
 
     for (const k in S) delete S[k];
-    Object.assign(S, { running: true, cfg, demo, runId: null, ping: null, prefill: null, single: null, decode: null, summary: null, error: null });
+    Object.assign(S, { running: true, cfg, demo, direct, runId: null, ping: null, prefill: null, single: null, decode: null, summary: null, error: null });
     $('#tModel').textContent = cfg.model;
-    $('#tHost').textContent = `${host(cfg.baseUrl)} · ${fmtTok(cfg.contextTokens)} 资料 · ${cfg.concurrency} 并发`;
+    $('#tHost').textContent = `${host(cfg.baseUrl)} · ${direct ? '浏览器直连 · ' : ''}${fmtTok(cfg.contextTokens)} 资料 · ${cfg.concurrency} 并发`;
     const order = ['ping', cfg.runPrefill && 'prefill', cfg.runSingle && 'single', cfg.runDecode && 'decode'].filter(Boolean);
     $('#steps').innerHTML = order.map((k) => `<li class="step wait" data-s="${k}"><span>${STAGE[k].name}</span><b>—</b><small></small></li>`).join('');
     $('#result').hidden = true;
@@ -671,22 +755,12 @@
 
     S.ctrl = new AbortController();
     try {
-      const res = await fetch('/api/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(cfg), signal: S.ctrl.signal });
-      if (!res.ok || !res.body) throw new Error('测速服务异常 HTTP ' + res.status);
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let i;
-        while ((i = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, i).trim();
-          buf = buf.slice(i + 1);
-          if (line) on(JSON.parse(line));
-        }
-      }
+      if (direct) {
+        const client = await loadDirectClient();
+        S.ctrl.signal.throwIfAborted();
+        S.directCtl = { id: crypto.randomUUID(), master: S.ctrl, stopDecode: null };
+        await client.runBenchmark(cfg, on, S.directCtl);
+      } else await runViaServer(cfg, S.ctrl.signal);
     } catch (e) {
       if (e.name !== 'AbortError') S.error = /fetch/i.test(e.message) ? '无法连接测速服务，请确认 npm start 正在运行' : e.message;
       else S.error = S.error || '已停止';
@@ -1011,17 +1085,18 @@
   function onDecodeResult(ev) {
     S.decode = ev;
     V.final = true;
-    V.rate = ev.throughput;
+    V.rate = ev.overlap?.throughput ?? null;
     V.avg = ev.avgSpeed;
-    setGauge(ev.throughput);
-    if (ev.avgSpeed != null) setTier(...tierOf('decode', ev.avgSpeed));
-    else setTier(0, ev.throughput == null ? '不可用' : '—');
+    setGauge(V.rate);
+    if (ev.overlap) setTier(...tierOf('decode', V.rate / ev.n));
+    else setTier(0, '不可用');
     punch($('#gNum'), 1.2);
     confetti(26, 1);
     SFX.boom();
     $('#btnEndDecode').hidden = true;
-    html($('#gSub'), `整轮端到端吞吐 · 单路解码平均 ${fmtRate(ev.avgSpeed)}`);
-    setStep('decode', 'done', fmt(ev.throughput, 1), 'tok/s');
+    $('#gK').textContent = `${ev.n} 路同时解码`;
+    html($('#gSub'), ev.overlap ? `共同解码窗口 ${fmtS(ev.overlap.windowMs)}` : '需要共同解码窗口和逐块累计用量');
+    setStep('decode', 'done', fmt(V.rate, 1), 'tok/s');
     const best = ev.lanes.filter((l) => l.ok && l.speed).sort((a, b) => b.speed - a.speed)[0];
     if (best && V.lanes[best.i]) {
       const W = V.lanes[best.i].el;
@@ -1032,7 +1107,7 @@
     const b = $('#banner');
     b.hidden = false;
     b.innerHTML = `<span class="flag"></span><span>${
-      ev.byUser ? '已提前结束，整轮吞吐不可用。' : `${ev.ok} / ${ev.n} 路完成，整轮用时 ${fmtS(ev.windowMs)}。`
+      ev.byUser ? '已提前结束，并发吞吐成绩不可用。' : `${ev.ok} / ${ev.n} 路完成，整轮用时 ${fmtS(ev.windowMs)}。`
     }${best ? ` 最快的是 <b>#${best.i + 1} ${esc(best.domain)}</b>，${fmt(best.speed, 1)} tok/s。` : ''}</span>`;
     anim(b, [{ transform: 'translateY(-14px) scale(.95)', opacity: 0 }, { transform: 'none', opacity: 1 }], { duration: 380, easing: 'cubic-bezier(.3,1.5,.5,1)' });
   }
@@ -1123,14 +1198,15 @@
   // ---------------- 结果
   const loadHist = () => store.get('ts3.hist', []);
   const bestOf = (cfg) => {
-    const h = loadHist().filter((x) => x.model === cfg.model && x.host === host(cfg.baseUrl) && x.metricsVersion === 2 && x.single != null);
+    const h = loadHist().filter((x) => x.model === cfg.model && x.host === host(cfg.baseUrl) &&
+      (x.thinkingMode || 'default') === cfg.thinkingMode && x.metricsVersion === 2 && x.single != null);
     return h.length ? Math.max(...h.map((x) => x.single)) : null;
   };
 
   function mainRating() {
     const { single: s, decode: d, prefill: p, ping } = S;
     if (s?.peak != null) return tierOf('single', s.peak);
-    if (d?.avgSpeed != null) return tierOf('decode', d.avgSpeed);
+    if (d?.overlap) return tierOf('decode', d.overlap.throughput / d.n);
     if (p?.throughput != null) return tierOf('prefill', p.throughput);
     return ping ? pingRate(ping.min) : [0, '—'];
   }
@@ -1145,7 +1221,7 @@
     if (ping) tiles.push(['响应延迟', fmt(ping.min, 0), 'ms', 'z1', '']);
     if (p) tiles.push(['读取速度', fmt(p.throughput, 1), p.throughput == null ? '整轮输入用量不完整' : 'tok/s · 首包前有效输入吞吐', 'z2', '']);
     if (s) tiles.push(['单发峰值', fmt(s.peak, 1), s.peak == null ? '需逐块用量与完整 2 秒窗口' : 'tok/s · 固定 2 秒窗口', 'z3', 'light']);
-    if (d) tiles.push([`${d.n} 并发合计`, fmt(d.throughput, 1), d.throughput == null ? '整轮输出用量不完整' : 'tok/s · 端到端', 'c1', 'light']);
+    if (d) tiles.push([`${d.n} 路同时解码`, fmt(d.overlap?.throughput, 1), d.overlap ? `tok/s · 共同窗口 ${fmtS(d.overlap.windowMs)}` : '需要共同窗口和逐块用量', 'c1', 'light']);
     const [ri, rname] = mainRating();
     const best = bestOf(cfg);
     let sub = '';
@@ -1153,13 +1229,12 @@
     else if (s?.peak != null && best == null) sub = '首次测试';
     else if (s?.peak != null && s.peak > best) sub = '本机新纪录';
     else if (s?.peak != null) sub = `本机最佳 ${fmt(best, 1)}`;
-    $('#rTop').innerHTML =
-      tiles.map(([k, v, u, c, cls]) => `<div class="r-tile ${cls}" style="--rc:var(--${c})"><span>${k}</span><b>${v}</b><small>${u}</small></div>`).join('') +
-      (ri ? `<div class="r-stamp" id="rStamp"><div><b>${rname}</b><span>${sub}</span></div></div>` : '');
+    $('#rTop').innerHTML = tiles.map(([k, v, u, c, cls]) => `<div class="r-tile ${cls}" style="--rc:var(--${c})"><span>${k}</span><b>${v}</b><small>${u}</small></div>`).join('');
+    $('#rStampSlot').innerHTML = ri ? `<div class="r-stamp" id="rStamp"><div><b>${rname}</b><span>${sub}</span></div></div>` : '';
 
     const parts = [];
     if (s?.byUser || d?.byUser) parts.push('生成阶段提前结束');
-    if (d && d.avgSpeed) parts.push(`${d.n} 路同时跑时每路约 <b>${fmt(d.avgSpeed, 1)}</b> tok/s`);
+    if (d?.overlap) parts.push(`${d.n} 路共同解码期间共输出 <b>${fmt(d.overlap.tokens, 0)}</b> tokens`);
     if (p) parts.push(`读取测试平均首包 <b>${fmtS(p.ttft.avg)}</b>`);
     if (d && d.cacheHitRate != null) parts.push(`前缀缓存命中 ${(d.cacheHitRate * 100).toFixed(0)}%`);
     if (S.error && S.error !== '已停止') parts.push(`<span class="err">测试未全部完成：${esc(S.error)}</span>`);
@@ -1179,6 +1254,8 @@
     const r = (k, v, cls) => rows.push(`<div class="d-row ${cls || ''}"><span>${k}</span><b>${v}</b></div>`);
     r('模型', esc(cfg.model));
     r('服务', esc(host(cfg.baseUrl)));
+    if (S.direct) r('请求路径', '浏览器直连本机');
+    if (cfg.thinkingMode !== 'default') r('思考模式', thinkingLabels[cfg.thinkingMode]);
     if (ping) {
       r('延迟 最快 / 平均', `${fmt(ping.min, 0)} / ${fmt(ping.avg, 0)} 毫秒`);
       r('延迟抖动', `${fmt(ping.jitter, 0)} 毫秒`);
@@ -1200,8 +1277,10 @@
       if (s.chunkGap) r('单发 输出块间隔 P50 / P99', `${fmt(s.chunkGap.p50, 1)} / ${fmt(s.chunkGap.p99, 1)} 毫秒`);
     }
     if (d) {
+      r(`${d.n} 路同时解码吞吐`, fmtRate(d.overlap?.throughput));
+      if (d.overlap) r('共同解码窗口 / 输出量', `${fmtS(d.overlap.windowMs)} / ${fmt(d.overlap.tokens, 0)} tokens`);
       r('并发 端到端输出吞吐', fmtRate(d.throughput));
-      r('并发 单路（最慢~最快）', d.avgSpeed == null ? '不可用' : `${fmtRate(d.avgSpeed)}（${fmt(d.minSpeed, 1)}–${fmt(d.maxSpeed, 1)}）`);
+      r('各路解码速率平均（最慢~最快）', d.avgSpeed == null ? '不可用' : `${fmtRate(d.avgSpeed)}（${fmt(d.minSpeed, 1)}–${fmt(d.maxSpeed, 1)}）`);
       r('并发 平均首包', fmtS(d.ttft && d.ttft.avg));
       r('缓存命中率', d.cacheHitRate != null ? `${(d.cacheHitRate * 100).toFixed(1)}%` : '服务未返回');
       if (d.chunkGap) r('并发 输出块间隔 P50 / P99', `${fmt(d.chunkGap.p50, 1)} / ${fmt(d.chunkGap.p99, 1)} 毫秒`);
@@ -1223,7 +1302,7 @@
       else
         setTimeout(() => {
           stamp.style.opacity = 1;
-          anim(stamp, [{ transform: 'scale(3) rotate(-40deg)', opacity: 0 }, { transform: 'scale(.92) rotate(-12deg)', opacity: 1, offset: 0.7 }, { transform: 'scale(1) rotate(-12deg)', opacity: 1 }], { duration: 420, easing: 'cubic-bezier(.5,0,.75,0)' });
+          anim(stamp, [{ transform: 'scale(1.15) rotate(-22deg)', opacity: 0 }, { transform: 'scale(.92) rotate(-12deg)', opacity: 1, offset: 0.7 }, { transform: 'scale(1) rotate(-12deg)', opacity: 1 }], { duration: 420, easing: 'cubic-bezier(.5,0,.75,0)' });
           setTimeout(() => {
             shake($('#result'), 1);
             SFX.stamp();
@@ -1239,7 +1318,10 @@
     if (ping) L.push(`响应延迟：${fmt(ping.min, 0)} 毫秒`);
     if (p) L.push(`首包前有效输入吞吐：${fmtRate(p.throughput)}`);
     if (s) L.push(`单发 2 秒峰值：${fmtRate(s.peak)}，解码平均 ${fmtRate(s.speed)}，端到端吞吐 ${fmtRate(s.e2eSpeed)}${s.byUser ? '（提前结束）' : ''}`);
-    if (d) L.push(`${d.n} 路并发端到端输出吞吐：${fmtRate(d.throughput)}${d.byUser ? '（提前结束）' : ''}`);
+    if (d) {
+      L.push(`${d.n} 路同时解码：${fmtRate(d.overlap?.throughput)}${d.overlap ? `（共同窗口 ${fmtS(d.overlap.windowMs)}）` : ''}`);
+      L.push(`整轮端到端输出吞吐：${fmtRate(d.throughput)}${d.byUser ? '（提前结束）' : ''}`);
+    }
     return L.join('\n');
   }
 
@@ -1271,7 +1353,7 @@
     if (ping) items.push(['响应延迟', fmt(ping.min, 0), 'ms', COL.z1, COL.ink]);
     if (p) items.push(['有效输入吞吐', fmt(p.throughput, 1), p.throughput == null ? '不可用' : 'tok/s', COL.z2, COL.ink]);
     if (s) items.push([s.byUser ? '单发峰值（提前结束）' : '单发 2 秒峰值', fmt(s.peak, 1), s.peak == null ? '不可用' : 'tok/s', COL.z3, '#fff']);
-    if (d) items.push([`${d.n} 路端到端吞吐`, fmt(d.throughput, 1), d.throughput == null ? '不可用' : 'tok/s', COL.c1, '#fff']);
+    if (d) items.push([`${d.n} 路同时解码`, fmt(d.overlap?.throughput, 1), d.overlap ? 'tok/s' : '不可用', COL.c1, '#fff']);
     const bars = d ? d.lanes.filter((l) => l.ok && l.speed) : [];
     const tw = (1080 - 160 - 30) / 2, th = 200, rowH = 50;
     // 先排版再定画布高度，行数多时整张图变长，元素不挤在一起
@@ -1394,7 +1476,11 @@
   function saveHistory() {
     const { ping, prefill: p, single: s, decode: d, cfg } = S;
     const h = loadHist();
-    h.unshift({ metricsVersion: 2, t: Date.now(), model: cfg.model, host: host(cfg.baseUrl), ping: ping && ping.min, prefill: p && p.throughput, single: s && !s.byUser ? s.peak : null, decode: d && d.throughput, n: d && d.n });
+    h.unshift({
+      metricsVersion: 2, t: Date.now(), model: cfg.model, host: host(cfg.baseUrl), thinkingMode: cfg.thinkingMode,
+      ping: ping && ping.min, prefill: p && p.throughput, single: s && !s.byUser ? s.peak : null,
+      decode: d && d.throughput, decodeOverlap: d ? d.overlap?.throughput ?? null : undefined, n: d && d.n,
+    });
     store.set('ts3.hist', h.slice(0, 50));
   }
   function renderHist() {
@@ -1403,11 +1489,11 @@
       ? h
           .map(
             (x) => `<div class="h-item"><div class="h-top"><b>${esc(x.model)}</b><span>${new Date(x.t).toLocaleString()}</span></div>
-            <div class="h-host">${esc(x.host)}${x.metricsVersion === 2 ? '' : ' · 旧版统计口径'}</div>
+            <div class="h-host">${esc(x.host)}${thinkingLabels[x.thinkingMode] && x.thinkingMode !== 'default' ? ' · 思考' + thinkingLabels[x.thinkingMode] : ''}${x.metricsVersion === 2 ? '' : ' · 旧版统计口径'}</div>
             <div class="h-vals"><div>延迟<b>${x.ping != null ? fmt(x.ping, 0) : '—'}</b></div>
             <div>读取<b>${fmt(x.prefill, 1)}</b></div>
             <div>峰值<b>${x.single != null ? fmt(x.single, 1) : '—'}</b></div>
-            <div>${x.n || ''} 并发<b>${fmt(x.decode, 1)}</b></div></div></div>`
+            <div>${Object.hasOwn(x, 'decodeOverlap') ? '同时解码' : '并发整轮'}<b>${fmt(Object.hasOwn(x, 'decodeOverlap') ? x.decodeOverlap : x.decode, 1)}</b></div></div></div>`
           )
           .join('')
       : '<div class="h-empty">还没有测速记录</div>';
@@ -1428,13 +1514,14 @@
     }
   });
   $('#btnStop').addEventListener('click', () => {
-    if (S.runId) fetch('/api/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: S.runId }) }).catch(() => {});
+    if (S.runId) fetch('./api/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: S.runId }) }).catch(() => {});
     S.error = '已停止';
     S.ctrl && S.ctrl.abort();
   });
   $('#btnEndDecode').addEventListener('click', () => {
     $('#btnEndDecode').hidden = true;
-    if (S.runId) fetch('/api/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: S.runId, scope: 'decode' }) }).catch(() => {});
+    if (S.directCtl) S.directCtl.stopDecode?.();
+    else if (S.runId) fetch('./api/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: S.runId, scope: 'decode' }) }).catch(() => {});
   });
   $('#btnHistory').addEventListener('click', () => {
     renderHist();
