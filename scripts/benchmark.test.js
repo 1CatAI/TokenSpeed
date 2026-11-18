@@ -1,11 +1,14 @@
 'use strict';
 const assert = require('node:assert/strict');
+const { webcrypto } = require('node:crypto');
 const http = require('node:http');
 const { once } = require('node:events');
 const { setTimeout: sleep } = require('node:timers/promises');
 const { test } = require('node:test');
-const { normalizeConfig, runBenchmark } = require('../lib/bench');
+const { runInNewContext } = require('node:vm');
+const { normalizeConfig, overlappingDecode, runBenchmark } = require('../lib/bench');
 const { streamRequest } = require('../lib/client');
+const { buildBrowserBundle } = require('../lib/browser-bundle');
 
 async function withUpstream(handler, check) {
   const server = http.createServer(async (req, res) => {
@@ -71,9 +74,9 @@ test('uses a fixed peak window and one shared batch duration with staggered stre
       openAIFinish(send, { completion_tokens: 22, prompt_tokens: 100 });
     } else {
       const slow = system.includes('前端移植题库');
-      await sleep(slow ? 170 : 20);
+      await sleep(slow ? 80 : 20);
       openAIChunk(send, 5);
-      await sleep(slow ? 120 : 70);
+      await sleep(slow ? 360 : 210);
       openAIChunk(send, 25);
       openAIFinish(send, { completion_tokens: 25, prompt_tokens: 1600, prompt_tokens_details: { cached_tokens: slow ? 0 : 800 } });
     }
@@ -90,8 +93,22 @@ test('uses a fixed peak window and one shared batch duration with staggered stre
     assert.equal(s.decode.totalTokens, 50);
     assert.equal(s.decode.throughput, 50 / (s.decode.windowMs / 1000));
     assert.ok(s.decode.throughput < s.decode.lanes.reduce((sum, lane) => sum + lane.speed, 0));
+    assert.equal(s.decode.overlap.tokens, 20);
+    assert.equal(s.decode.overlap.throughput, 20 / (s.decode.overlap.windowMs / 1000));
+    assert.ok(s.decode.overlap.windowMs < s.decode.windowMs);
     assert.equal(s.decode.cacheHitRate, 0.25);
   });
+});
+
+test('counts only token arrivals within one common 8-lane decode window', () => {
+  const fast = [[0, 4], [1000, 14], [1000, 19], [2000, 39], [3000, 59]];
+  const lastToStart = [[1000, 6], [1500, 11], [2500, 21], [4000, 63]];
+  const longTail = [[500, 3], [1000, 8], [2500, 28], [8000, 300]];
+  const lanes = [fast, lastToStart, ...Array(6).fill(longTail)];
+  assert.deepEqual(overlappingDecode(lanes), { tokens: 175, windowMs: 2000, throughput: 87.5 });
+  assert.deepEqual(overlappingDecode([fast, lastToStart, ...Array(6).fill([...longTail, [30000, 800]])]), overlappingDecode(lanes));
+  assert.equal(overlappingDecode([fast, [[3000, 5], [4000, 20]]]), null);
+  assert.equal(overlappingDecode([fast, null]), null);
 });
 
 test('missing and final-only usage produce different available metrics', async () => {
@@ -114,6 +131,7 @@ test('missing and final-only usage produce different available metrics', async (
     assert.ok(s.single.e2eSpeed > 0);
     assert.equal(s.decode.totalTokens, 64);
     assert.ok(s.decode.throughput > 0);
+    assert.equal(s.decode.overlap, null);
     assert.equal(s.decode.avgSpeed, null);
     assert.equal(s.decode.cacheHitRate, null);
   });
@@ -152,6 +170,7 @@ test('an interrupted generation stage cannot publish a batch throughput', async 
       if (ev.type === 'tick' && ev.phase === 'decode' && ev.lanes.some((lane) => lane.c > 0)) ctl.stopDecode();
     });
     assert.equal(s.decode.byUser, true);
+    assert.equal(s.decode.overlap, null);
     assert.equal(s.decode.totalTokens, null);
     assert.equal(s.decode.throughput, null);
   });
@@ -178,4 +197,71 @@ test('extra parameters cannot change the workload being measured', () => {
   assert.throws(() => normalizeConfig({ ...config, extraBody: '{"max_tokens":1000}' }), /不能覆盖测速字段/);
   assert.throws(() => normalizeConfig({ ...config, extraBody: '{"n":2}' }), /不能覆盖测速字段/);
   assert.deepEqual(normalizeConfig({ ...config, extraBody: '{"enable_thinking":false}' }).extraBody, { enable_thinking: false });
+});
+
+test('the thinking switch sends the selected vLLM template setting for every stage', async () => {
+  const requests = [];
+  await withUpstream((request, send) => {
+    requests.push(request);
+    openAIChunk(send, 1);
+    openAIFinish(send, { prompt_tokens: 30, completion_tokens: 1 });
+  }, async (baseUrl) => {
+    const extraBody = { temperature: 0.7, enable_thinking: true, chat_template_kwargs: { enable_thinking: true, other_option: 'keep' } };
+    await run(baseUrl, { thinkingMode: 'off', extraBody });
+    assert.equal(requests.length, 10);
+    assert.ok(requests.some((request) => request.max_tokens === 1));
+    assert.ok(requests.some((request) => request.max_tokens === 2048));
+    for (const request of requests) {
+      assert.equal(request.temperature, 0.7);
+      assert.equal(request.enable_thinking, undefined);
+      assert.deepEqual(request.chat_template_kwargs, { enable_thinking: false, other_option: 'keep' });
+    }
+    assert.equal(extraBody.chat_template_kwargs.enable_thinking, true);
+  });
+});
+
+test('default preserves advanced parameters and official endpoints use their own thinking formats', () => {
+  const config = { baseUrl: 'http://127.0.0.1:12345', model: 'fixture' };
+  assert.equal(normalizeConfig(config).extraBody, null);
+  assert.deepEqual(normalizeConfig({ ...config, thinkingMode: 'default', extraBody: { reasoning_effort: 'low' } }).extraBody, { reasoning_effort: 'low' });
+  assert.deepEqual(normalizeConfig({ ...config, thinkingMode: 'on' }).extraBody, { chat_template_kwargs: { enable_thinking: true } });
+  assert.deepEqual(normalizeConfig({ ...config, baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', thinkingMode: 'off' }).extraBody, { enable_thinking: false });
+  assert.deepEqual(normalizeConfig({ ...config, baseUrl: 'https://api.deepseek.com/v1', thinkingMode: 'on' }).extraBody, { thinking: { type: 'enabled' } });
+});
+
+test('the browser bundle lists models and completes a benchmark over loopback fetch', async () => {
+  const requests = [];
+  const browser = {
+    AbortController, AbortSignal, TextDecoder, URL, crypto: webcrypto, performance, setTimeout, setInterval, clearInterval,
+    fetch: (url, options) => {
+      requests.push({ url, options });
+      if (url.endsWith('/models')) return Promise.resolve(new Response('{"data":[{"id":"fixture"}]}'));
+      return fetch(url, options);
+    },
+  };
+  const bundle = buildBrowserBundle().plain.toString('utf8');
+  assert.match(bundle, /Copyright \(c\) OpenAI/);
+  assert.match(bundle, /MBPP dataset by Google Research/);
+  runInNewContext(bundle, browser);
+  await withUpstream((request, send) => {
+    openAIChunk(send, 1);
+    openAIFinish(send, { completion_tokens: 1, prompt_tokens: 30 });
+  }, async (baseUrl) => {
+    const client = browser.TokenSpeedDirect;
+    const cfg = { baseUrl, model: 'fixture', thinkingMode: 'off', contextTokens: 1000, concurrency: 1, runPrefill: false, runSingle: false };
+    assert.equal((await client.listModels(cfg)).join(), 'fixture');
+    let summary;
+    await client.runBenchmark(cfg, (ev) => {
+      if (ev.type === 'done') summary = ev.summary;
+    }, { id: 'browser', master: new AbortController() });
+    assert.equal(summary.decode.ok, 1);
+    assert.equal(summary.config.extraBody.chat_template_kwargs.enable_thinking, false);
+    assert.equal(requests.length, 7);
+    for (const { url, options } of requests) {
+      assert.ok(url.startsWith(baseUrl + '/'));
+      assert.equal(options.credentials, 'omit');
+      assert.equal(options.redirect, 'error');
+      assert.equal(options.targetAddressSpace, 'loopback');
+    }
+  });
 });

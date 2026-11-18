@@ -44,7 +44,8 @@
         <div class="fields">
           <div class="field" id="baseField" hidden>
             <label for="fBase">接口地址</label>
-            <input id="fBase" placeholder="https://your-server.com/v1" spellcheck="false" autocomplete="off" />
+            <input id="fBase" placeholder="https://your-server.com/v1" spellcheck="false" autocomplete="off" aria-describedby="directHint" />
+            <small class="hint" id="directHint" hidden></small>
             <div class="seg mini" id="fFormat">
               <button type="button" data-v="openai" class="on">OpenAI 格式</button>
               <button type="button" data-v="anthropic">Anthropic 格式</button>
@@ -66,6 +67,15 @@
               <datalist id="modelList"></datalist>
               <button class="in-btn" id="btnModels" type="button">获取列表</button>
             </div>
+          </div>
+          <div class="field" id="thinkingField">
+            <span class="label" id="thinkingLabel">思考模式</span>
+            <div class="seg" id="fThinking" role="group" aria-labelledby="thinkingLabel" aria-describedby="thinkingHint">
+              <button type="button" data-v="default" class="on" aria-pressed="true">跟随接口</button>
+              <button type="button" data-v="on" aria-pressed="false">开启</button>
+              <button type="button" data-v="off" aria-pressed="false">关闭</button>
+            </div>
+            <small class="hint" id="thinkingHint">需上游模型支持思考开关。</small>
           </div>
         </div>
 
@@ -110,7 +120,7 @@
           </div>
           <div class="adv-row col">
             <span class="adv-k">额外请求参数（JSON，可选）</span>
-            <input id="fExtra" placeholder='例如 {"enable_thinking": false}' spellcheck="false" />
+            <input id="fExtra" placeholder='例如 {"temperature": 0.7}' spellcheck="false" />
           </div>
           <p class="cost" id="cost"></p>
         </div>
@@ -134,9 +144,12 @@
       <!-- 结果 -->
       <section class="result" id="result" hidden>
         <div class="r-top" id="rTop"></div>
-        <p class="verdict" id="verdict"></p>
+        <div class="r-meta">
+          <p class="verdict" id="verdict"></p>
+          <div id="rStampSlot"></div>
+        </div>
         <div class="card r-bars" id="rBarsCard" hidden>
-          <h3>各领域单路生成速度 <span>代码和 JSON 最容易被 MTP / 投机解码猜中，通常最快</span></h3>
+          <h3>各领域单路解码速度 <span>按各路自己的首末输出时间计算，单位 tok/s</span></h3>
           <div id="rBars"></div>
         </div>
         <details class="card detail">
